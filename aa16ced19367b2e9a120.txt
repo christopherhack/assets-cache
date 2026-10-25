@@ -1,0 +1,1756 @@
+-- ====================================================================
+-- GENX LOADER v4 — Roblox UI & Core Execution Logic (Delta Compatible)
+-- ====================================================================
+
+-- CONFIGURATION
+local BACKEND_URL     = "https://genx-backend-ljq1.onrender.com"
+local LOADER_ID       = "43e2b29fa10e"
+local LOADER_NAME     = "Gggg"
+local GENX_ICON_ID    = "YOUR_ICON"
+local KEY_FILE        = "genx_" .. LOADER_ID .. ".key"                              -- saved key for auto-login
+local HEARTBEAT_EVERY = 60                                          -- seconds
+
+-- SOUNDS (leave a placeholder and that sound is simply skipped)
+local INTRO_SOUND_ID = "rbxassetid://71950057614035"  -- cinematic boom, plays the moment the animation starts
+local INTRO_VOLUME   = 0.7
+local OUTRO_SOUND_ID = "rbxassetid://1839090417"  -- heartbeat, plays when the intro fades out
+local OUTRO_VOLUME   = 0.8
+local INTRO_FADE_OUT = 1.0                                 -- seconds the intro sound takes to fade away
+
+-- GAME AUDIO
+local MUTE_GAME_AUDIO    = true  -- mute every game sound while the loader is open (only GENX sounds play)
+local RESTORE_GAME_AUDIO = true  -- give the game its sound back when the loader closes (false = stay muted)
+
+-- SERVICES
+local TweenService     = game:GetService("TweenService")
+local HttpService      = game:GetService("HttpService")
+local UserInputService = game:GetService("UserInputService")
+local RunService       = game:GetService("RunService")
+local SoundService     = game:GetService("SoundService")
+local ContentProvider  = game:GetService("ContentProvider")
+local CoreGui          = game:GetService("CoreGui")
+local Players          = game:GetService("Players")
+local StarterGui       = game:GetService("StarterGui")
+
+local LocalPlayer = Players.LocalPlayer
+
+local COLOR_OK   = Color3.fromRGB(80, 255, 120)
+local COLOR_ERR  = Color3.fromRGB(255, 80, 80)
+local COLOR_INFO = Color3.fromRGB(200, 200, 200)
+
+local ES, ED = Enum.EasingStyle, Enum.EasingDirection
+
+-----------------------------------------------------------------------
+-- HELPERS
+-----------------------------------------------------------------------
+local function httpRequest(options)
+    local fn = (syn and syn.request) or (http and http.request) or http_request or request
+    if not fn then error("Executor does not support HTTP requests.") end
+    return fn(options)
+end
+
+-- Retries (Render free/cold instances can take ~30s to wake up)
+local function request(options, attempts, onRetry)
+    local lastErr = "unknown error"
+    for i = 1, attempts do
+        local ok, res = pcall(httpRequest, options)
+        if ok and type(res) == "table" and res.Body and (res.StatusCode or 0) < 500 then
+            return res
+        end
+        lastErr = ok and ("HTTP " .. tostring(res and res.StatusCode)) or tostring(res)
+        if i < attempts then
+            if onRetry then onRetry(i) end
+            task.wait(4)
+        end
+    end
+    return nil, lastErr
+end
+
+local function decode(body)
+    local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
+    return ok and type(data) == "table" and data or nil
+end
+
+local function getHWID()
+    local ok, id = pcall(function()
+        if gethwid then return gethwid() end
+        return game:GetService("RbxAnalyticsService"):GetClientId()
+    end)
+    return (ok and id) and tostring(id) or "unknown"
+end
+
+local function saveKey(key)
+    pcall(function() if writefile then writefile(KEY_FILE, key) end end)
+end
+local function loadKey()
+    local g = (getgenv and getgenv().script_key) or rawget(_G, "script_key")
+    if type(g) == "string" and g ~= "" then return g end
+    local ok, key = pcall(function()
+        if isfile and readfile and isfile(KEY_FILE) then return readfile(KEY_FILE) end
+    end)
+    return (ok and type(key) == "string") and key:gsub("%s+", "") or ""
+end
+local function forgetKey()
+    pcall(function() if delfile and isfile and isfile(KEY_FILE) then delfile(KEY_FILE) end end)
+end
+
+local function guiParent()
+    local ok, ui = pcall(function() return gethui and gethui() end)
+    return (ok and ui) or CoreGui
+end
+
+local function tween(obj, time, style, dir, props)
+    local t = TweenService:Create(obj, TweenInfo.new(time, style, dir), props)
+    t:Play()
+    return t
+end
+
+-- CLEANUP PREVIOUS RUN (both possible parents + leftover song)
+for _, parent in ipairs({ CoreGui, guiParent() }) do
+    local old = parent:FindFirstChild("GENXLoaderUI")
+    if old then old:Destroy() end
+end
+for _, n in ipairs({ "GENXIntroSong", "GENXIntroSfx", "GENXOutroSfx" }) do
+    local o = SoundService:FindFirstChild(n)
+    if o then o:Destroy() end
+end
+
+-- MAIN SCREEN GUI
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "GENXLoaderUI"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.IgnoreGuiInset = true
+ScreenGui.DisplayOrder = 999
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.Parent = guiParent()
+
+-----------------------------------------------------------------------
+-- 0. AUDIO: game mute + intro / outro sounds
+-----------------------------------------------------------------------
+local introRunning = true
+local introConns = {}
+
+local function mkSound(name, id, vol)
+    if not id or id == "" or id:find("YOUR_") then return nil end
+    local s = Instance.new("Sound")
+    s.Name = name
+    s:SetAttribute("GENX", true) -- marks it so the mute system never touches it
+    s.SoundId = id
+    s.Volume = vol
+    s.Looped = false
+    s.Parent = SoundService
+    return s
+end
+local IntroSfx = mkSound("GENXIntroSfx", INTRO_SOUND_ID, 0)
+local OutroSfx = mkSound("GENXOutroSfx", OUTRO_SOUND_ID, OUTRO_VOLUME)
+if OutroSfx then OutroSfx.Looped = true end -- heartbeat loops until the key is accepted
+
+-- Game mute: zero every Sound that isn't ours, keep new ones muted, hold them at 0
+local mutedVolumes = {}
+local muteConns = {}
+
+local function muteSound(s)
+    if not s:IsA("Sound") or s:GetAttribute("GENX") then return end
+    if mutedVolumes[s] == nil then mutedVolumes[s] = s.Volume end
+    s.Volume = 0
+    table.insert(muteConns, s:GetPropertyChangedSignal("Volume"):Connect(function()
+        if s.Volume ~= 0 then
+            mutedVolumes[s] = s.Volume -- remember what the game wanted
+            s.Volume = 0
+        end
+    end))
+end
+
+local function muteGame()
+    if not MUTE_GAME_AUDIO then return end
+    pcall(function()
+        for _, d in ipairs(game:GetDescendants()) do muteSound(d) end
+    end)
+    table.insert(muteConns, game.DescendantAdded:Connect(muteSound))
+end
+
+local function restoreGame()
+    for _, c in ipairs(muteConns) do c:Disconnect() end
+    table.clear(muteConns)
+    if RESTORE_GAME_AUDIO then
+        for s, v in pairs(mutedVolumes) do
+            if s.Parent then pcall(function() s.Volume = v end) end
+        end
+    end
+    table.clear(mutedVolumes)
+end
+
+local function playSfx(s, vol, fadeIn)
+    if not s then return end
+    task.spawn(function()
+        pcall(function() ContentProvider:PreloadAsync({ s }) end)
+        if not s.Parent or not s.IsLoaded then return end -- skip silently if the asset is blocked/private
+        pcall(function() s.TimePosition = 0 s:Play() end)
+        tween(s, fadeIn or 0.2, ES.Sine, ED.Out, { Volume = vol })
+    end)
+end
+
+local function fadeStopSfx(s, t)
+    if not s then return end
+    tween(s, t, ES.Sine, ED.In, { Volume = 0 })
+    task.delay(t + 0.1, function() pcall(function() s:Stop() s:Destroy() end) end)
+end
+
+ScreenGui.Destroying:Connect(function()
+    restoreGame()
+    if IntroSfx then pcall(function() IntroSfx:Destroy() end) end
+    if OutroSfx then pcall(function() OutroSfx:Stop() OutroSfx:Destroy() end) end
+end)
+
+-----------------------------------------------------------------------
+-- 1. FULLSCREEN INTRO (built here, animated in section 3)
+-----------------------------------------------------------------------
+-- THEME + GAME CHECK (server decides colors, title, logo, discord)
+local THEME, DISCORD, INFO = {}, nil, nil
+do
+    local res = request({ Url = BACKEND_URL .. "/api/check", Method = "POST", Headers = { ["Content-Type"] = "application/json" },
+        Body = HttpService:JSONEncode({ loader_id = LOADER_ID, game_id = tostring(game.GameId) }) }, 6)
+    local c = res and decode(res.Body)
+    if c and c.supported == false then
+        pcall(function() StarterGui:SetCore("SendNotification", { Title = LOADER_NAME, Text = c.message or "Game not supported", Duration = 6 }) end)
+        return
+    end
+    if c then
+        THEME = (c.theme and c.theme.spec) or {}
+        DISCORD, INFO = c.discord, c
+        if c.loader_id then LOADER_ID = c.loader_id end
+    end
+end
+local function C3(h, d)
+    if type(h) == "string" and #h == 7 then
+        return Color3.fromRGB(tonumber(h:sub(2, 3), 16) or 0, tonumber(h:sub(4, 5), 16) or 0, tonumber(h:sub(6, 7), 16) or 0)
+    end
+    return d
+end
+GENX_ICON_ID = THEME.icon or GENX_ICON_ID
+local TITLE = tostring((THEME.title and THEME.title ~= "") and THEME.title or LOADER_NAME):upper():gsub("[^%w]", ""):sub(1, 4)
+local PURPLE  = C3(THEME.accent, Color3.fromRGB(170, 0, 255))
+local PINK    = Color3.fromRGB(235, 80, 255)
+local WHITE   = Color3.new(1, 1, 1)
+local LOGO_BG = Color3.fromRGB(4, 0, 22)
+local CELL_OFF = Color3.fromRGB(35, 28, 52)
+local rng = Random.new()
+
+local hasIcon = not GENX_ICON_ID:find("YOUR_")
+
+local STAGE_W, STAGE_H = 460, 500
+local CX, CY = 230, 180
+local CENTER_ST = UDim2.fromOffset(CX, CY)
+
+local function makeCircle(parent, size, pos, z)
+    local f = Instance.new("Frame")
+    f.AnchorPoint = Vector2.new(0.5, 0.5)
+    f.Position = pos
+    f.Size = size
+    f.BackgroundTransparency = 1
+    f.BorderSizePixel = 0
+    f.ZIndex = z or 1
+    f.Parent = parent
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(1, 0)
+    c.Parent = f
+    return f
+end
+
+local Container = Instance.new("Frame")
+Container.Size = UDim2.new(1, 0, 1, 0)
+Container.BackgroundColor3 = WHITE
+Container.BorderSizePixel = 0
+Container.Active = true
+Container.Parent = ScreenGui
+
+local BgGradient = Instance.new("UIGradient")
+BgGradient.Color = ColorSequence.new(Color3.fromRGB(26, 8, 52), Color3.fromRGB(4, 0, 16))
+BgGradient.Rotation = 90
+BgGradient.Parent = Container
+
+local Stage = Instance.new("Frame")
+Stage.AnchorPoint = Vector2.new(0.5, 0.5)
+Stage.Position = UDim2.new(0.5, 0, 0.5, 0)
+Stage.Size = UDim2.fromOffset(STAGE_W, STAGE_H)
+Stage.BackgroundTransparency = 1
+Stage.ZIndex = 2
+Stage.Parent = Container
+
+local StageScale = Instance.new("UIScale")
+StageScale.Parent = Stage
+
+local function fitStage()
+    local cam = workspace.CurrentCamera
+    local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
+    StageScale.Scale = math.clamp(math.min(vp.Y / 540, vp.X / 480), 0.5, 1.3)
+end
+fitStage()
+do
+    local cam = workspace.CurrentCamera
+    if cam then
+        table.insert(introConns, cam:GetPropertyChangedSignal("ViewportSize"):Connect(fitStage))
+    end
+end
+
+local Flash = Instance.new("Frame")
+Flash.Size = UDim2.new(1, 0, 1, 0)
+Flash.BackgroundColor3 = WHITE
+Flash.BackgroundTransparency = 1
+Flash.BorderSizePixel = 0
+Flash.ZIndex = 20
+Flash.Parent = Container
+
+-- HUD corner brackets framing the screen
+local Brackets = {}
+local function makeBracket(ax, ay)
+    local holder = Instance.new("Frame")
+    holder.AnchorPoint = Vector2.new(ax, ay)
+    holder.Position = UDim2.new(ax, ax == 0 and 28 or -28, ay, ay == 0 and 28 or -28)
+    holder.Size = UDim2.fromOffset(34, 34)
+    holder.BackgroundTransparency = 1
+    holder.ZIndex = 2
+    holder.Parent = Container
+    for _, horiz in ipairs({ true, false }) do
+        local bar = Instance.new("Frame")
+        bar.AnchorPoint = Vector2.new(ax, ay)
+        bar.Position = UDim2.fromScale(ax, ay)
+        bar.Size = horiz and UDim2.new(1, 0, 0, 2) or UDim2.new(0, 2, 1, 0)
+        bar.BackgroundColor3 = PURPLE
+        bar.BackgroundTransparency = 1
+        bar.BorderSizePixel = 0
+        bar.ZIndex = 2
+        bar.Parent = holder
+        table.insert(Brackets, bar)
+    end
+end
+makeBracket(0, 0) makeBracket(1, 0) makeBracket(0, 1) makeBracket(1, 1)
+
+-- Scan line that sweeps down and "prints" the logo as it passes
+local ScanBar = Instance.new("Frame")
+ScanBar.AnchorPoint = Vector2.new(0.5, 0.5)
+ScanBar.Position = UDim2.new(0.5, 0, 0, -10)
+ScanBar.Size = UDim2.new(1, 0, 0, 3)
+ScanBar.BackgroundColor3 = WHITE
+ScanBar.BackgroundTransparency = 1
+ScanBar.BorderSizePixel = 0
+ScanBar.ZIndex = 4
+ScanBar.Parent = Container
+do
+    local g = Instance.new("UIGradient")
+    g.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, PINK),
+        ColorSequenceKeypoint.new(0.5, WHITE),
+        ColorSequenceKeypoint.new(1, PINK),
+    })
+    g.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 1),
+        NumberSequenceKeypoint.new(0.5, 0),
+        NumberSequenceKeypoint.new(1, 1),
+    })
+    g.Parent = ScanBar
+end
+
+-- Soft glow behind the logo
+local glowTargets = { 0.93, 0.9, 0.85 }
+local Glow = {}
+for i, s in ipairs({ 340, 250, 185 }) do
+    local g = makeCircle(Stage, UDim2.fromOffset(s, s), CENTER_ST, 2)
+    g.BackgroundColor3 = PURPLE
+    g.BackgroundTransparency = 1
+    Glow[i] = g
+end
+
+-- Thin static ring
+local BaseRing = makeCircle(Stage, UDim2.fromOffset(196, 196), CENTER_ST, 2)
+local BaseStroke = Instance.new("UIStroke")
+BaseStroke.Thickness = 2
+BaseStroke.Color = PURPLE
+BaseStroke.Transparency = 1
+BaseStroke.Parent = BaseRing
+
+-- Spinning gradient arcs
+local Arcs = {}
+local function makeArc(size, thickness, speed, color, alpha)
+    local f = makeCircle(Stage, UDim2.fromOffset(size, size), CENTER_ST, 3)
+    local s = Instance.new("UIStroke")
+    s.Thickness = thickness
+    s.Color = color
+    s.Transparency = 1
+    s.Parent = f
+    local g = Instance.new("UIGradient")
+    g.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0),
+        NumberSequenceKeypoint.new(0.45, 0.25),
+        NumberSequenceKeypoint.new(0.6, 1),
+        NumberSequenceKeypoint.new(1, 1),
+    })
+    g.Parent = s
+    table.insert(Arcs, { grad = g, speed = speed, stroke = s, alpha = alpha })
+end
+makeArc(206, 4, 280, PINK, 0.1)
+makeArc(240, 2, -170, PURPLE, 0.3)
+
+-- Orbs riding the two arcs
+local Orbs = {}
+for i, cfg in ipairs({
+    { radius = 103, speed = 1.8 },
+    { radius = 120, speed = -1.3 },
+}) do
+    local o = makeCircle(Stage, UDim2.fromOffset(7, 7), CENTER_ST, 4)
+    o.BackgroundColor3 = (i == 2) and PURPLE or PINK
+    o.BackgroundTransparency = 1
+    Orbs[i] = { frame = o, radius = cfg.radius, speed = cfg.speed, phase = (i - 1) * math.pi }
+end
+
+-- Tick ring: a scanner head runs around it once the intro is live
+local TICKS = 60
+local TickHolder = Instance.new("Frame")
+TickHolder.AnchorPoint = Vector2.new(0.5, 0.5)
+TickHolder.Position = CENTER_ST
+TickHolder.Size = UDim2.fromOffset(300, 300)
+TickHolder.BackgroundTransparency = 1
+TickHolder.ZIndex = 3
+TickHolder.Parent = Stage
+
+local Ticks = {}
+for i = 1, TICKS do
+    local ang = (i - 1) / TICKS * 2 * math.pi
+    local long = (i - 1) % 5 == 0
+    local tk = Instance.new("Frame")
+    tk.AnchorPoint = Vector2.new(0.5, 0.5)
+    tk.Size = UDim2.fromOffset(2, long and 12 or 6)
+    tk.Position = UDim2.fromOffset(150 + math.sin(ang) * 133, 150 - math.cos(ang) * 133)
+    tk.Rotation = math.deg(ang)
+    tk.BackgroundColor3 = long and PINK or PURPLE
+    tk.BackgroundTransparency = 1
+    tk.BorderSizePixel = 0
+    tk.ZIndex = 3
+    tk.Parent = TickHolder
+    Ticks[i] = tk
+end
+
+-- Logo medallion
+local LogoHolder = Instance.new("Frame")
+LogoHolder.AnchorPoint = Vector2.new(0.5, 0.5)
+LogoHolder.Position = CENTER_ST
+LogoHolder.Size = UDim2.fromOffset(180, 180)
+LogoHolder.BackgroundColor3 = LOGO_BG
+LogoHolder.BackgroundTransparency = 1
+LogoHolder.BorderSizePixel = 0
+LogoHolder.ZIndex = 5
+LogoHolder.Parent = Stage
+
+local LogoHolderCorner = Instance.new("UICorner")
+LogoHolderCorner.CornerRadius = UDim.new(1, 0)
+LogoHolderCorner.Parent = LogoHolder
+
+local LogoHolderStroke = Instance.new("UIStroke")
+LogoHolderStroke.Color = PURPLE
+LogoHolderStroke.Thickness = 2
+LogoHolderStroke.Transparency = 1
+LogoHolderStroke.Parent = LogoHolder
+
+local LogoScale = Instance.new("UIScale")
+LogoScale.Scale = 0.01
+LogoScale.Parent = LogoHolder
+
+local Logo = Instance.new("ImageLabel")
+Logo.Size = UDim2.new(1, 0, 1, 0)
+Logo.BackgroundTransparency = 1
+Logo.Image = hasIcon and GENX_ICON_ID or ""
+Logo.ScaleType = Enum.ScaleType.Crop
+Logo.ImageTransparency = 1
+Logo.ZIndex = 5
+Logo.Parent = LogoHolder
+
+local LogoCorner = Instance.new("UICorner")
+LogoCorner.CornerRadius = UDim.new(1, 0)
+LogoCorner.Parent = Logo
+
+local LogoFallback = Instance.new("TextLabel")
+LogoFallback.Size = UDim2.new(1, 0, 1, 0)
+LogoFallback.BackgroundTransparency = 1
+LogoFallback.Font = Enum.Font.GothamBlack
+LogoFallback.Text = TITLE:sub(1, 2)
+LogoFallback.TextSize = 56
+LogoFallback.TextColor3 = WHITE
+LogoFallback.TextTransparency = 1
+LogoFallback.Visible = not hasIcon
+LogoFallback.ZIndex = 5
+LogoFallback.Parent = LogoHolder
+
+local LogoFallbackStroke = Instance.new("UIStroke")
+LogoFallbackStroke.Color = PURPLE
+LogoFallbackStroke.Thickness = 3
+LogoFallbackStroke.Transparency = 1
+LogoFallbackStroke.Parent = LogoFallback
+
+-- Title: each letter decodes from noise, then locks in
+local TitleRow = Instance.new("Frame")
+TitleRow.AnchorPoint = Vector2.new(0.5, 0.5)
+TitleRow.Position = UDim2.fromOffset(CX, 340)
+TitleRow.Size = UDim2.fromOffset(220, 56)
+TitleRow.BackgroundTransparency = 1
+TitleRow.ZIndex = 5
+TitleRow.Parent = Stage
+
+local RowLayout = Instance.new("UIListLayout")
+RowLayout.FillDirection = Enum.FillDirection.Horizontal
+RowLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+RowLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+RowLayout.Padding = UDim.new(0, 10)
+RowLayout.Parent = TitleRow
+
+local Letters = {}
+for i = 1, 4 do
+    local wrap = Instance.new("Frame")
+    wrap.Size = UDim2.new(0, 40, 0, 56)
+    wrap.BackgroundTransparency = 1
+    wrap.ClipsDescendants = true
+    wrap.LayoutOrder = i
+    wrap.ZIndex = 5
+    wrap.Parent = TitleRow
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, 0, 1, 0)
+    lbl.Position = UDim2.new(0, 0, 0, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Font = Enum.Font.GothamBlack
+    lbl.Text = (TITLE):sub(i, i)
+    lbl.TextSize = 40
+    lbl.TextColor3 = WHITE
+    lbl.TextTransparency = 1
+    lbl.ZIndex = 5
+    lbl.Parent = wrap
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = PURPLE
+    stroke.Thickness = 2
+    stroke.Transparency = 1
+    stroke.Parent = lbl
+
+    local grad = Instance.new("UIGradient")
+    grad.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, WHITE),
+        ColorSequenceKeypoint.new(0.5, Color3.fromRGB(235, 150, 255)),
+        ColorSequenceKeypoint.new(1, WHITE),
+    })
+    grad.Offset = Vector2.new(-1, 0)
+    grad.Parent = lbl
+
+    Letters[i] = { label = lbl, stroke = stroke, grad = grad }
+end
+
+local Subtitle = Instance.new("TextLabel")
+Subtitle.AnchorPoint = Vector2.new(0.5, 0.5)
+Subtitle.Position = UDim2.fromOffset(CX, 384)
+Subtitle.Size = UDim2.fromOffset(260, 16)
+Subtitle.BackgroundTransparency = 1
+Subtitle.Font = Enum.Font.GothamMedium
+Subtitle.Text = table.concat({ "L", "O", "A", "D", "E", "R" }, " ")
+Subtitle.TextSize = 11
+Subtitle.TextColor3 = Color3.fromRGB(190, 150, 235)
+Subtitle.TextTransparency = 1
+Subtitle.ZIndex = 5
+Subtitle.Parent = Stage
+
+-- Segmented progress bar (24 cells)
+local CELLS = 24
+local ProgressTrack = Instance.new("Frame")
+ProgressTrack.AnchorPoint = Vector2.new(0.5, 0.5)
+ProgressTrack.Position = UDim2.fromOffset(CX, 426)
+ProgressTrack.Size = UDim2.fromOffset(261, 6)
+ProgressTrack.BackgroundTransparency = 1
+ProgressTrack.ZIndex = 5
+ProgressTrack.Parent = Stage
+
+local TrackLayout = Instance.new("UIListLayout")
+TrackLayout.FillDirection = Enum.FillDirection.Horizontal
+TrackLayout.Padding = UDim.new(0, 3)
+TrackLayout.Parent = ProgressTrack
+
+local Cells = {}
+for i = 1, CELLS do
+    local c = Instance.new("Frame")
+    c.Size = UDim2.fromOffset(8, 6)
+    c.BackgroundColor3 = CELL_OFF
+    c.BackgroundTransparency = 1
+    c.BorderSizePixel = 0
+    c.LayoutOrder = i
+    c.ZIndex = 6
+    c.Parent = ProgressTrack
+    local cc = Instance.new("UICorner")
+    cc.CornerRadius = UDim.new(0, 2)
+    cc.Parent = c
+    Cells[i] = c
+end
+
+local StageText = Instance.new("TextLabel")
+StageText.AnchorPoint = Vector2.new(0, 0.5)
+StageText.Position = UDim2.fromOffset(CX - 130, 446)
+StageText.Size = UDim2.fromOffset(190, 16)
+StageText.BackgroundTransparency = 1
+StageText.Font = Enum.Font.Gotham
+StageText.Text = ""
+StageText.TextSize = 12
+StageText.TextXAlignment = Enum.TextXAlignment.Left
+StageText.TextColor3 = Color3.fromRGB(150, 140, 175)
+StageText.TextTransparency = 1
+StageText.ZIndex = 5
+StageText.Parent = Stage
+
+local PercentText = Instance.new("TextLabel")
+PercentText.AnchorPoint = Vector2.new(1, 0.5)
+PercentText.Position = UDim2.fromOffset(CX + 130, 446)
+PercentText.Size = UDim2.fromOffset(60, 16)
+PercentText.BackgroundTransparency = 1
+PercentText.Font = Enum.Font.GothamBold
+PercentText.Text = "0%"
+PercentText.TextSize = 12
+PercentText.TextXAlignment = Enum.TextXAlignment.Right
+PercentText.TextColor3 = Color3.fromRGB(215, 170, 255)
+PercentText.TextTransparency = 1
+PercentText.ZIndex = 5
+PercentText.Parent = Stage
+
+local ProgressValue = Instance.new("NumberValue")
+ProgressValue.Parent = ScreenGui
+ProgressValue.Changed:Connect(function(v)
+    local lit = math.floor(math.clamp(v, 0, 1) * CELLS + 0.5)
+    for i, c in ipairs(Cells) do
+        if i <= lit then
+            c.BackgroundColor3 = (i == lit and v < 1) and WHITE or PURPLE:Lerp(PINK, i / CELLS)
+        else
+            c.BackgroundColor3 = CELL_OFF
+        end
+    end
+    PercentText.Text = string.format("%d%%", math.floor(v * 100 + 0.5))
+end)
+
+-----------------------------------------------------------------------
+-- 2. KEY SYSTEM WINDOW
+-----------------------------------------------------------------------
+local KeyFrame = Instance.new("Frame")
+KeyFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+KeyFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
+KeyFrame.Size = UDim2.new(0, 336, 0, 308)
+KeyFrame.BackgroundColor3 = Color3.fromRGB(18, 15, 25)
+KeyFrame.BackgroundTransparency = 0
+KeyFrame.BorderSizePixel = 0
+KeyFrame.Visible = false
+KeyFrame.Parent = ScreenGui
+
+local KeyCorner = Instance.new("UICorner")
+KeyCorner.CornerRadius = UDim.new(0, 16)
+KeyCorner.Parent = KeyFrame
+
+local KeyStroke = Instance.new("UIStroke")
+KeyStroke.Color = Color3.fromRGB(140, 30, 220)
+KeyStroke.Thickness = 2
+KeyStroke.Transparency = 0
+KeyStroke.Color = WHITE
+KeyStroke.Parent = KeyFrame
+
+-- Glass tint on the card + a light that circles the border
+do
+    local glass = Instance.new("UIGradient")
+    glass.Color = ColorSequence.new(WHITE, Color3.fromRGB(175, 155, 205))
+    glass.Rotation = 90
+    glass.Parent = KeyFrame
+
+    local edge = Instance.new("UIGradient")
+    edge.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(90, 20, 160)),
+        ColorSequenceKeypoint.new(0.35, PINK),
+        ColorSequenceKeypoint.new(0.7, Color3.fromRGB(90, 20, 160)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(90, 20, 160)),
+    })
+    edge.Parent = KeyStroke
+    TweenService:Create(edge, TweenInfo.new(3.5, ES.Linear, ED.Out, -1), { Rotation = 360 }):Play()
+end
+
+local KeyScale = Instance.new("UIScale")
+local keyBase = 1 -- fits the card to small screens
+do
+    local cam = workspace.CurrentCamera
+    local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
+    keyBase = math.clamp(math.min(vp.Y / 360, vp.X / 370), 0.7, 1)
+end
+KeyScale.Scale = keyBase
+KeyScale.Parent = KeyFrame
+
+-- Header area (also the drag handle): logo + title
+local DragBar = Instance.new("Frame")
+DragBar.Size = UDim2.new(1, 0, 0, 100)
+DragBar.BackgroundTransparency = 1
+DragBar.Active = true
+DragBar.Parent = KeyFrame
+
+local KeyLogoHolder = Instance.new("Frame")
+KeyLogoHolder.AnchorPoint = Vector2.new(0.5, 0)
+KeyLogoHolder.Position = UDim2.new(0.5, 0, 0, 14)
+KeyLogoHolder.Size = UDim2.fromOffset(50, 50)
+KeyLogoHolder.BackgroundColor3 = LOGO_BG
+KeyLogoHolder.BorderSizePixel = 0
+KeyLogoHolder.Parent = DragBar
+
+local KeyLogoCorner = Instance.new("UICorner")
+KeyLogoCorner.CornerRadius = UDim.new(1, 0)
+KeyLogoCorner.Parent = KeyLogoHolder
+
+local KeyLogoStroke = Instance.new("UIStroke")
+KeyLogoStroke.Color = Color3.fromRGB(140, 30, 220)
+KeyLogoStroke.Thickness = 1.5
+KeyLogoStroke.Parent = KeyLogoHolder
+
+if hasIcon then
+    local img = Instance.new("ImageLabel")
+    img.Size = UDim2.new(1, 0, 1, 0)
+    img.BackgroundTransparency = 1
+    img.Image = GENX_ICON_ID
+    img.ScaleType = Enum.ScaleType.Crop
+    img.Parent = KeyLogoHolder
+    local ic = Instance.new("UICorner")
+    ic.CornerRadius = UDim.new(1, 0)
+    ic.Parent = img
+else
+    local t = Instance.new("TextLabel")
+    t.Size = UDim2.new(1, 0, 1, 0)
+    t.BackgroundTransparency = 1
+    t.Font = Enum.Font.GothamBlack
+    t.Text = "GX"
+    t.TextSize = 18
+    t.TextColor3 = WHITE
+    t.Parent = KeyLogoHolder
+end
+
+local HeaderText = Instance.new("TextLabel")
+HeaderText.Position = UDim2.new(0, 0, 0, 70)
+HeaderText.Size = UDim2.new(1, 0, 0, 24)
+HeaderText.BackgroundTransparency = 1
+HeaderText.Font = Enum.Font.GothamBold
+HeaderText.Text = "GENX KEY SYSTEM"
+HeaderText.TextColor3 = Color3.fromRGB(220, 220, 255)
+HeaderText.TextSize = 18
+HeaderText.Parent = DragBar
+
+local StatusLabel = Instance.new("TextLabel")
+StatusLabel.Position = UDim2.new(0.08, 20, 0, 98)
+StatusLabel.Size = UDim2.new(0.84, -20, 0, 32)
+StatusLabel.BackgroundTransparency = 1
+StatusLabel.Font = Enum.Font.Gotham
+StatusLabel.Text = "Ready \u{2022} enter your access key"
+StatusLabel.TextColor3 = Color3.fromRGB(150, 150, 170)
+StatusLabel.TextSize = 13
+StatusLabel.TextWrapped = true
+StatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+StatusLabel.Parent = KeyFrame
+
+local KeyBox = Instance.new("TextBox")
+KeyBox.Position = UDim2.new(0.08, 0, 0, 140)
+KeyBox.Size = UDim2.new(0.84, 0, 0, 46)
+KeyBox.BackgroundColor3 = Color3.fromRGB(28, 24, 38)
+KeyBox.Font = Enum.Font.GothamMedium
+KeyBox.PlaceholderText = "GENX-XXXX-XXXX-XXXX"
+KeyBox.PlaceholderColor3 = Color3.fromRGB(100, 100, 120)
+KeyBox.Text = ""
+KeyBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+KeyBox.TextSize = 14
+KeyBox.ClearTextOnFocus = false
+KeyBox.Parent = KeyFrame
+
+local KeyBoxCorner = Instance.new("UICorner")
+KeyBoxCorner.CornerRadius = UDim.new(0, 8)
+KeyBoxCorner.Parent = KeyBox
+
+local KeyBoxStroke = Instance.new("UIStroke")
+KeyBoxStroke.Color = Color3.fromRGB(60, 50, 80)
+KeyBoxStroke.Thickness = 1
+KeyBoxStroke.Parent = KeyBox
+
+local EnterBtn = Instance.new("TextButton")
+EnterBtn.Position = UDim2.new(0.08, 0, 0, 198)
+EnterBtn.Size = UDim2.new(0.84, 0, 0, 46)
+EnterBtn.BackgroundColor3 = Color3.fromRGB(140, 30, 220)
+EnterBtn.Font = Enum.Font.GothamBold
+EnterBtn.Text = "ENTER KEY"
+EnterBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+EnterBtn.TextSize = 14
+EnterBtn.AutoButtonColor = false
+EnterBtn.Parent = KeyFrame
+
+local EnterCorner = Instance.new("UICorner")
+EnterCorner.CornerRadius = UDim.new(0, 8)
+EnterCorner.Parent = EnterBtn
+
+do -- purple-to-pink sheen on the main button
+    local g = Instance.new("UIGradient")
+    g.Color = ColorSequence.new(WHITE, Color3.fromRGB(255, 185, 255))
+    g.Parent = EnterBtn
+end
+
+local DiscordBtn = Instance.new("TextButton")
+DiscordBtn.Position = UDim2.new(0.08, 0, 0, 256)
+DiscordBtn.Size = UDim2.new(0.84, 0, 0, 42)
+DiscordBtn.BackgroundColor3 = Color3.fromRGB(35, 30, 48)
+DiscordBtn.Font = Enum.Font.GothamMedium
+DiscordBtn.Text = "COPY DISCORD INVITE"
+DiscordBtn.TextColor3 = Color3.fromRGB(180, 160, 220)
+DiscordBtn.TextSize = 13
+DiscordBtn.AutoButtonColor = false
+DiscordBtn.Parent = KeyFrame
+
+local DiscordCorner = Instance.new("UICorner")
+DiscordCorner.CornerRadius = UDim.new(0, 8)
+DiscordCorner.Parent = DiscordBtn
+
+-- GLOBAL MESSAGE BANNER (set from Discord with /update global). Sits under the card.
+local MsgBanner = Instance.new("TextLabel")
+MsgBanner.AnchorPoint = Vector2.new(0.5, 0)
+MsgBanner.Position = UDim2.new(0.5, 0, 1, 12)
+MsgBanner.Size = UDim2.new(1, 0, 0, 0)
+MsgBanner.AutomaticSize = Enum.AutomaticSize.Y
+MsgBanner.BackgroundColor3 = Color3.fromRGB(28, 14, 44)
+MsgBanner.BackgroundTransparency = 0.1
+MsgBanner.Font = Enum.Font.GothamMedium
+MsgBanner.RichText = true
+MsgBanner.Text = ""
+MsgBanner.TextColor3 = Color3.fromRGB(235, 215, 255)
+MsgBanner.TextSize = 13
+MsgBanner.TextWrapped = true
+MsgBanner.Visible = false
+MsgBanner.Parent = KeyFrame
+do
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 10)
+    c.Parent = MsgBanner
+    local p = Instance.new("UIPadding")
+    p.PaddingTop, p.PaddingBottom = UDim.new(0, 8), UDim.new(0, 8)
+    p.PaddingLeft, p.PaddingRight = UDim.new(0, 12), UDim.new(0, 12)
+    p.Parent = MsgBanner
+    local st = Instance.new("UIStroke")
+    st.Color = Color3.fromRGB(140, 30, 220)
+    st.Thickness = 1
+    st.Parent = MsgBanner
+end
+
+local lastMsgId = 0 -- id of the newest global message this device has already seen
+
+local function applyMessage(text)
+    text = tostring(text or "")
+    if text == "" then
+        MsgBanner.Visible = false
+        return
+    end
+    text = text:gsub("&", "&amp;")
+    text = text:gsub("<", "&lt;")
+    text = text:gsub(">", "&gt;")
+    MsgBanner.Text = '<font color="#EB50FF"><b>GLOBAL MESSAGE</b></font>\n' .. text
+    MsgBanner.Visible = true
+end
+
+-- In-game toast for people who are already running the script
+local function notify(title, text)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", { Title = title, Text = tostring(text), Duration = 8 })
+    end)
+end
+
+-- Hover / press feel for the buttons, focus glow for the key box
+local function juice(btn, base, hover)
+    local sc = Instance.new("UIScale")
+    sc.Parent = btn
+    btn.MouseEnter:Connect(function()
+        tween(btn, 0.15, ES.Quad, ED.Out, { BackgroundColor3 = hover })
+    end)
+    btn.MouseLeave:Connect(function()
+        tween(btn, 0.15, ES.Quad, ED.Out, { BackgroundColor3 = base })
+        tween(sc, 0.1, ES.Quad, ED.Out, { Scale = 1 })
+    end)
+    btn.MouseButton1Down:Connect(function()
+        tween(sc, 0.08, ES.Quad, ED.Out, { Scale = 0.96 })
+    end)
+    btn.MouseButton1Up:Connect(function()
+        tween(sc, 0.15, ES.Back, ED.Out, { Scale = 1 })
+    end)
+end
+juice(EnterBtn, Color3.fromRGB(140, 30, 220), Color3.fromRGB(165, 60, 245))
+juice(DiscordBtn, Color3.fromRGB(35, 30, 48), Color3.fromRGB(48, 40, 66))
+
+-- PREMIUM KEY INPUT: neon halo, focus animation, paste icon
+local KEY_IDLE = Color3.fromRGB(60, 50, 80)
+local keyFocused = false
+
+do
+    local pad = Instance.new("UIPadding") -- keeps typed text clear of the paste icon
+    pad.PaddingLeft = UDim.new(0, 40)
+    pad.PaddingRight = UDim.new(0, 40)
+    pad.Parent = KeyBox
+end
+
+local KeyGlow = Instance.new("Frame") -- neon halo around the input
+KeyGlow.Position = UDim2.new(0.08, -3, 0, 137)
+KeyGlow.Size = UDim2.new(0.84, 6, 0, 52)
+KeyGlow.BackgroundTransparency = 1
+KeyGlow.BorderSizePixel = 0
+KeyGlow.Parent = KeyFrame
+do
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 11)
+    c.Parent = KeyGlow
+end
+local KeyGlowStroke = Instance.new("UIStroke")
+KeyGlowStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+KeyGlowStroke.Thickness = 3
+KeyGlowStroke.Color = PURPLE
+KeyGlowStroke.Transparency = 0.88
+KeyGlowStroke.Parent = KeyGlow
+
+local PasteBtn = Instance.new("TextButton") -- clipboard icon drawn from frames
+PasteBtn.AnchorPoint = Vector2.new(1, 0.5)
+PasteBtn.Position = UDim2.new(0.92, -8, 0, 163)
+PasteBtn.Size = UDim2.fromOffset(34, 34)
+PasteBtn.BackgroundTransparency = 1
+PasteBtn.Text = ""
+PasteBtn.AutoButtonColor = false
+PasteBtn.Parent = KeyFrame
+do
+    local ICON = Color3.fromRGB(150, 120, 205)
+    local body = Instance.new("Frame")
+    body.AnchorPoint = Vector2.new(0.5, 0.5)
+    body.Position = UDim2.new(0.5, 0, 0.5, 1)
+    body.Size = UDim2.fromOffset(13, 16)
+    body.BackgroundTransparency = 1
+    body.Parent = PasteBtn
+    local bc = Instance.new("UICorner") bc.CornerRadius = UDim.new(0, 3) bc.Parent = body
+    local bs = Instance.new("UIStroke")
+    bs.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    bs.Thickness = 1.6
+    bs.Color = ICON
+    bs.Parent = body
+    local clip = Instance.new("Frame")
+    clip.AnchorPoint = Vector2.new(0.5, 0.5)
+    clip.Position = UDim2.new(0.5, 0, 0.5, -7)
+    clip.Size = UDim2.fromOffset(7, 4)
+    clip.BackgroundColor3 = ICON
+    clip.BorderSizePixel = 0
+    clip.Parent = PasteBtn
+    local cc = Instance.new("UICorner") cc.CornerRadius = UDim.new(0, 2) cc.Parent = clip
+    PasteBtn.MouseEnter:Connect(function()
+        tween(bs, 0.15, ES.Quad, ED.Out, { Color = PINK })
+        tween(clip, 0.15, ES.Quad, ED.Out, { BackgroundColor3 = PINK })
+    end)
+    PasteBtn.MouseLeave:Connect(function()
+        tween(bs, 0.15, ES.Quad, ED.Out, { Color = ICON })
+        tween(clip, 0.15, ES.Quad, ED.Out, { BackgroundColor3 = ICON })
+    end)
+end
+
+KeyBox.Focused:Connect(function()
+    keyFocused = true
+    tween(KeyBoxStroke, 0.22, ES.Quad, ED.Out, { Color = PINK, Thickness = 2 })
+    tween(KeyBox, 0.22, ES.Quad, ED.Out,
+        { BackgroundColor3 = Color3.fromRGB(36, 30, 50), PlaceholderColor3 = Color3.fromRGB(60, 55, 80) })
+    tween(KeyGlowStroke, 0.22, ES.Quad, ED.Out, { Transparency = 0.45, Color = PINK })
+end)
+KeyBox.FocusLost:Connect(function()
+    keyFocused = false
+    tween(KeyBoxStroke, 0.22, ES.Quad, ED.Out, { Color = KEY_IDLE, Thickness = 1 })
+    tween(KeyBox, 0.22, ES.Quad, ED.Out,
+        { BackgroundColor3 = Color3.fromRGB(28, 24, 38), PlaceholderColor3 = Color3.fromRGB(100, 100, 120) })
+    tween(KeyGlowStroke, 0.22, ES.Quad, ED.Out, { Transparency = 0.88, Color = PURPLE })
+end)
+
+-- ANIMATED ACTIVATE BUTTON: shimmer sweep + loading spinner
+EnterBtn.ClipsDescendants = true
+do
+    local sh = Instance.new("Frame")
+    sh.AnchorPoint = Vector2.new(0.5, 0.5)
+    sh.Position = UDim2.new(-0.3, 0, 0.5, 0)
+    sh.Size = UDim2.new(0.26, 0, 1.8, 0)
+    sh.Rotation = 18
+    sh.BackgroundColor3 = WHITE
+    sh.BackgroundTransparency = 0.82
+    sh.BorderSizePixel = 0
+    sh.ZIndex = 2
+    sh.Parent = EnterBtn
+    local g = Instance.new("UIGradient")
+    g.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 1),
+        NumberSequenceKeypoint.new(0.5, 0),
+        NumberSequenceKeypoint.new(1, 1),
+    })
+    g.Parent = sh
+    task.spawn(function()
+        while ScreenGui.Parent do
+            task.wait(2.4)
+            if KeyFrame.Visible and EnterBtn.Text == "ENTER KEY" then
+                sh.Position = UDim2.new(-0.3, 0, 0.5, 0)
+                tween(sh, 0.9, ES.Quad, ED.InOut, { Position = UDim2.new(1.3, 0, 0.5, 0) })
+            end
+            task.wait(0.9)
+        end
+    end)
+end
+
+local Spinner = makeCircle(EnterBtn, UDim2.fromOffset(16, 16), UDim2.new(0.5, -74, 0.5, 0), 3)
+Spinner.Visible = false
+do
+    local st = Instance.new("UIStroke")
+    st.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    st.Thickness = 2
+    st.Color = WHITE
+    st.Parent = Spinner
+    local g = Instance.new("UIGradient")
+    g.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0),
+        NumberSequenceKeypoint.new(0.5, 0.35),
+        NumberSequenceKeypoint.new(0.72, 1),
+        NumberSequenceKeypoint.new(1, 1),
+    })
+    g.Parent = st
+    TweenService:Create(Spinner, TweenInfo.new(0.9, ES.Linear, ED.In, -1), { Rotation = 360 }):Play()
+end
+
+-- Touch + mouse dragging (works on mobile, unlike Draggable)
+do
+    local dragging, dragStart, startPos
+    DragBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging, dragStart, startPos = true, input.Position, KeyFrame.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch) then
+            local d = input.Position - dragStart
+            KeyFrame.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + d.X,
+                startPos.Y.Scale, startPos.Y.Offset + d.Y
+            )
+        end
+    end)
+end
+
+-- LIVE STATUS INDICATOR: Ready / Checking key / Activated / Invalid key
+local StatusDot = Instance.new("Frame")
+StatusDot.AnchorPoint = Vector2.new(0, 0.5)
+StatusDot.Position = UDim2.new(0.08, 4, 0, 114)
+StatusDot.Size = UDim2.fromOffset(8, 8)
+StatusDot.BackgroundColor3 = PURPLE
+StatusDot.BorderSizePixel = 0
+StatusDot.Parent = KeyFrame
+do
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(1, 0)
+    c.Parent = StatusDot
+end
+local DotScale = Instance.new("UIScale")
+DotScale.Parent = StatusDot
+
+local dotTween
+local function setDot(color, period)
+    StatusDot.BackgroundColor3 = color
+    if dotTween then dotTween:Cancel() end
+    DotScale.Scale = 1
+    if period then
+        dotTween = TweenService:Create(DotScale,
+            TweenInfo.new(period, ES.Sine, ED.InOut, -1, true), { Scale = 1.7 })
+        dotTween:Play()
+    end
+end
+setDot(PURPLE, 0.9)
+
+local statusText = {
+    ["Verifying key..."] = "Checking key...",
+    ["Key valid! Loading script..."] = "Activated \u{2022} loading script",
+}
+local function setStatus(text, color)
+    text = statusText[text] or text
+    StatusLabel.Text = text
+    StatusLabel.TextColor3 = color or COLOR_INFO
+    local low = text:lower()
+    if color == COLOR_ERR then
+        setDot(COLOR_ERR, nil)
+    elseif color == COLOR_OK then
+        setDot(COLOR_OK, 0.7)
+    elseif low:find("check") or low:find("wak") or low:find("logging") then
+        setDot(PINK, 0.35)
+    else
+        setDot(PURPLE, 0.9)
+    end
+    if color == COLOR_ERR or color == COLOR_OK then -- key box flashes red / green
+        KeyBoxStroke.Color = color
+        tween(KeyBoxStroke, 1, ES.Quad, ED.Out, { Color = keyFocused and PINK or KEY_IDLE })
+    end
+end
+
+PasteBtn.MouseButton1Click:Connect(function()
+    local ok, clip = pcall(function() return getclipboard and getclipboard() end)
+    clip = (ok and type(clip) == "string") and clip:gsub("%s+", "") or ""
+    if clip ~= "" then
+        KeyBox.Text = clip
+        setStatus("Ready \u{2022} key pasted", COLOR_INFO)
+    else
+        setStatus("Clipboard empty \u{2022} long-press the box to paste", COLOR_INFO)
+        KeyBox:CaptureFocus()
+    end
+end)
+
+local function shake()
+    task.spawn(function()
+        local base = KeyFrame.Position
+        for _, dx in ipairs({ 8, -8, 5, -5, 0 }) do
+            KeyFrame.Position = UDim2.new(base.X.Scale, base.X.Offset + dx, base.Y.Scale, base.Y.Offset)
+            task.wait(0.04)
+        end
+    end)
+end
+
+-----------------------------------------------------------------------
+-- 2b. BUTTON GLOW (beats with the heartbeat inside the card)
+-----------------------------------------------------------------------
+KeyBoxStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border -- keeps the placeholder text crisp
+
+local EnterStroke = Instance.new("UIStroke")
+EnterStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+EnterStroke.Color = PINK
+EnterStroke.Thickness = 2
+EnterStroke.Transparency = 0.75
+EnterStroke.Parent = EnterBtn
+
+-----------------------------------------------------------------------
+-- 3. INTRO ANIMATION
+-----------------------------------------------------------------------
+
+-- Remember the key window's final look so it can fade in/out as one piece
+local KeyFade = {}
+do
+    local function add(inst)
+        local goal = {}
+        if inst:IsA("GuiObject") then goal.BackgroundTransparency = inst.BackgroundTransparency end
+        if inst:IsA("TextLabel") or inst:IsA("TextButton") or inst:IsA("TextBox") then
+            goal.TextTransparency = inst.TextTransparency
+        end
+        if inst:IsA("ImageLabel") then goal.ImageTransparency = inst.ImageTransparency end
+        if inst:IsA("UIStroke") then goal.Transparency = inst.Transparency end
+        if next(goal) then table.insert(KeyFade, { inst = inst, goal = goal }) end
+    end
+    add(KeyFrame)
+    for _, d in ipairs(KeyFrame:GetDescendants()) do add(d) end
+end
+
+-----------------------------------------------------------------------
+-- 3b. LIVE HEARTBEAT INSIDE THE CARD (clipped to the rounded card, behind all content)
+-----------------------------------------------------------------------
+local CARD_W = 336
+local Ecg = Instance.new("CanvasGroup")
+Ecg.Size = UDim2.new(1, 0, 1, 0)
+Ecg.BackgroundTransparency = 1
+Ecg.BorderSizePixel = 0
+Ecg.GroupTransparency = 1
+Ecg.ZIndex = 0
+Ecg.Parent = KeyFrame
+do
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 16)
+    c.Parent = Ecg
+end
+
+local EcgGlow = makeCircle(Ecg, UDim2.fromOffset(250, 250), UDim2.fromScale(0.5, 0.42), 1)
+EcgGlow.BackgroundColor3 = PURPLE
+EcgGlow.BackgroundTransparency = 0.88
+
+-- One heartbeat: soft P wave, sharp QRS spike, rounded T wave
+local WAVE = {
+    { 0, 0 }, { 0.16, 0 }, { 0.19, 0.05 }, { 0.22, 0.10 }, { 0.25, 0.05 }, { 0.28, 0 },
+    { 0.40, 0 }, { 0.43, -0.12 }, { 0.47, 1 }, { 0.52, -0.38 }, { 0.55, 0 }, { 0.64, 0 },
+    { 0.69, 0.10 }, { 0.74, 0.20 }, { 0.79, 0.10 }, { 0.84, 0 }, { 1, 0 },
+}
+local EcgLines = {}
+local function buildEcg(y, amp, period, speed, color, alpha)
+    local copies = math.ceil(CARD_W / period) + 2
+    local holder = Instance.new("Frame")
+    holder.AnchorPoint = Vector2.new(0, 0.5)
+    holder.Position = UDim2.new(0, 0, y, 0)
+    holder.Size = UDim2.fromOffset(period * copies, 2)
+    holder.BackgroundTransparency = 1
+    holder.ZIndex = 2
+    holder.Parent = Ecg
+    for c = 0, copies - 1 do
+        for i = 1, #WAVE - 1 do
+            local x1, y1 = (c + WAVE[i][1]) * period, -WAVE[i][2] * amp
+            local x2, y2 = (c + WAVE[i + 1][1]) * period, -WAVE[i + 1][2] * amp
+            local dx, dy = x2 - x1, y2 - y1
+            local seg = Instance.new("Frame")
+            seg.AnchorPoint = Vector2.new(0.5, 0.5)
+            seg.Position = UDim2.fromOffset((x1 + x2) / 2, 1 + (y1 + y2) / 2)
+            seg.Size = UDim2.fromOffset(math.sqrt(dx * dx + dy * dy) + 1.2, 1.6)
+            seg.Rotation = math.deg(math.atan2(dy, dx))
+            seg.BackgroundColor3 = color
+            seg.BackgroundTransparency = alpha
+            seg.BorderSizePixel = 0
+            seg.ZIndex = 2
+            seg.Parent = holder
+        end
+    end
+    table.insert(EcgLines, { holder = holder, y = y, period = period, speed = speed,
+        offset = rng:NextNumber(0, period) })
+end
+
+--        y     amp  period speed color   alpha
+buildEcg(0.07, 16, 250, 55,  PURPLE, 0.60)
+buildEcg(0.21, 24, 290, 80,  PINK,   0.50)
+buildEcg(0.35, 18, 230, 100, PURPLE, 0.65)
+buildEcg(0.50, 28, 320, 70,  PINK,   0.45)
+buildEcg(0.64, 20, 260, 95,  PURPLE, 0.60)
+buildEcg(0.78, 26, 300, 65,  PINK,   0.50)
+buildEcg(0.93, 16, 240, 110, PURPLE, 0.60)
+
+local Motes = {} -- a few slow, faint particles inside the card
+for i = 1, 8 do
+    local sz = rng:NextInteger(2, 3)
+    local m = makeCircle(Ecg, UDim2.fromOffset(sz, sz), UDim2.fromScale(0.5, 0.5), 1)
+    m.BackgroundColor3 = (i % 2 == 0) and PINK or PURPLE
+    m.BackgroundTransparency = rng:NextNumber(0.6, 0.8)
+    Motes[i] = { f = m, x = rng:NextNumber(0.05, 0.95), y = rng:NextNumber(0, 1), v = rng:NextNumber(0.012, 0.03) }
+end
+
+local ecgShow, ecgTarget, bgClock, beatLive = 0, 1, 0, false
+local bgConn = RunService.RenderStepped:Connect(function(dt)
+    if not KeyFrame.Visible then return end
+    bgClock = bgClock + dt
+    for _, m in ipairs(Motes) do
+        m.y = m.y - m.v * dt
+        if m.y < 0 then m.y = 1 end
+        m.f.Position = UDim2.fromScale(m.x, m.y)
+    end
+    ecgShow = ecgShow + (ecgTarget - ecgShow) * math.min(1, dt * 5)
+    for _, L in ipairs(EcgLines) do
+        L.holder.Position = UDim2.new(0, -((bgClock * L.speed + L.offset) % L.period), L.y, 0)
+    end
+    -- lub-dub: strong beat, then a softer second one
+    local ph = bgClock % 1.1
+    local pulse = math.min(1, math.exp(-ph * 9) + (ph > 0.3 and 0.65 * math.exp(-(ph - 0.3) * 9) or 0))
+    Ecg.GroupTransparency = 1 - ecgShow * (0.55 + 0.45 * pulse)
+    EcgGlow.BackgroundTransparency = 0.9 - 0.08 * pulse
+    if beatLive then
+        EnterStroke.Transparency = 0.75 - 0.6 * pulse
+        KeyLogoStroke.Thickness = 1.5 + 1.5 * pulse -- logo ring beats too
+        if not keyFocused then KeyGlowStroke.Transparency = 0.9 - 0.3 * pulse end -- input halo beats
+    end
+end)
+ScreenGui.Destroying:Connect(function() bgConn:Disconnect() end)
+
+local function fadeKey(show, t)
+    if not show then
+        for _, item in ipairs(KeyFade) do
+            local goal = {}
+            for prop in pairs(item.goal) do goal[prop] = 1 end
+            tween(item.inst, t, ES.Quad, ED.In, goal)
+        end
+        tween(KeyScale, t, ES.Quad, ED.In, { Scale = keyBase * 0.94 })
+        return
+    end
+
+    -- entrance order: card, header, status, input, activate button, discord button
+    local groups = {
+        { 0.12, { DragBar } },
+        { 0.22, { StatusLabel, StatusDot } },
+        { 0.32, { KeyBox, KeyGlow, PasteBtn } },
+        { 0.42, { EnterBtn } },
+        { 0.52, { DiscordBtn } },
+    }
+    local function delayOf(inst)
+        for _, g in ipairs(groups) do
+            for _, root in ipairs(g[2]) do
+                if inst == root or inst:IsDescendantOf(root) then return g[1] end
+            end
+        end
+        return 0
+    end
+
+    for _, g in ipairs(groups) do
+        for _, root in ipairs(g[2]) do
+            local final = root.Position
+            root.Position = final + UDim2.fromOffset(0, 10)
+            task.delay(g[1], function() tween(root, 0.45, ES.Quint, ED.Out, { Position = final }) end)
+        end
+    end
+    for _, item in ipairs(KeyFade) do
+        local goal = {}
+        for prop, value in pairs(item.goal) do
+            item.inst[prop] = 1
+            goal[prop] = value
+        end
+        task.delay(delayOf(item.inst), function()
+            tween(item.inst, 0.45, ES.Quad, ED.Out, goal)
+        end)
+    end
+    KeyScale.Scale = keyBase * 0.92
+    KeyFrame.Position = UDim2.new(0.5, 0, 0.5, 22)
+    tween(KeyScale, t, ES.Back, ED.Out, { Scale = keyBase })
+    tween(KeyFrame, t + 0.1, ES.Quint, ED.Out, { Position = UDim2.new(0.5, 0, 0.5, 0) })
+end
+
+local function fadeOutTree(root, t)
+    for _, d in ipairs(root:GetDescendants()) do
+        local goal = {}
+        if d:IsA("GuiObject") then goal.BackgroundTransparency = 1 end
+        if d:IsA("TextLabel") then goal.TextTransparency = 1 end
+        if d:IsA("ImageLabel") then goal.ImageTransparency = 1 end
+        if d:IsA("UIStroke") then goal.Transparency = 1 end
+        if next(goal) then
+            tween(d, t, ES.Quad, ED.In, goal)
+        end
+    end
+end
+
+local function flash(strength, t)
+    Flash.BackgroundTransparency = 1 - strength
+    tween(Flash, t or 0.6, ES.Quad, ED.Out, { BackgroundTransparency = 1 })
+end
+
+-- Expanding ring that fades out
+local function shockwave(startSize, endSize, t, thickness)
+    local f = makeCircle(Stage, UDim2.fromOffset(startSize, startSize), CENTER_ST, 3)
+    local s = Instance.new("UIStroke")
+    s.Thickness = thickness or 3
+    s.Color = PINK
+    s.Transparency = 0.3
+    s.Parent = f
+    tween(f, t, ES.Quad, ED.Out, { Size = UDim2.fromOffset(endSize, endSize) })
+    tween(s, t, ES.Quad, ED.Out, { Transparency = 1 })
+    task.delay(t + 0.1, function() f:Destroy() end)
+end
+
+-- Drifting background particles
+local function startParticles()
+    for _ = 1, 28 do
+        task.spawn(function()
+            task.wait(rng:NextNumber(0, 5))
+            local sz = rng:NextInteger(2, 5)
+            local p = makeCircle(Container, UDim2.fromOffset(sz, sz), UDim2.new(0.5, 0, 1.1, 0), 1)
+            p.BackgroundColor3 = rng:NextNumber() > 0.5 and PURPLE or PINK
+            while introRunning and p.Parent do
+                local x = rng:NextNumber(0.02, 0.98)
+                local dur = rng:NextNumber(5, 10)
+                p.Position = UDim2.new(x, 0, 1.05, 0)
+                p.BackgroundTransparency = rng:NextNumber(0.45, 0.85)
+                tween(p, dur, ES.Linear, ED.Out,
+                    { Position = UDim2.new(x + rng:NextNumber(-0.06, 0.06), 0, -0.05, 0) })
+                task.wait(dur)
+            end
+        end)
+    end
+end
+
+local DECODE_CHARS = { "G", "E", "N", "X", "#", "/", "0", "1", "$", "%", "<", ">" }
+
+local function decodeLetter(l, finalChar, dur)
+    task.spawn(function()
+        tween(l.label, 0.2, ES.Quad, ED.Out, { TextTransparency = 0 })
+        tween(l.stroke, 0.2, ES.Quad, ED.Out, { Transparency = 0.45 })
+        l.label.TextColor3 = PINK
+        local t0 = os.clock()
+        while os.clock() - t0 < dur do
+            l.label.Text = DECODE_CHARS[rng:NextInteger(1, #DECODE_CHARS)]
+            task.wait(0.04)
+        end
+        l.label.Text = finalChar
+        l.label.TextColor3 = WHITE
+        l.label.Position = UDim2.fromOffset(0, -5)
+        tween(l.label, 0.25, ES.Back, ED.Out, { Position = UDim2.fromOffset(0, 0) })
+    end)
+end
+
+local statusToken = 0
+local function typeStatus(text)
+    statusToken = statusToken + 1
+    local mine = statusToken
+    task.spawn(function()
+        for i = 1, #text do
+            if mine ~= statusToken then return end
+            StageText.Text = text:sub(1, i)
+            task.wait(0.018)
+        end
+    end)
+end
+
+local function playIntroAnimation()
+    -- Wake the Render server while the intro plays (cold starts can take ~30s)
+    local warmDone, warmOk = false, false
+    task.spawn(function()
+        local res = request({ Url = BACKEND_URL .. "/health", Method = "GET" }, 8)
+        warmOk = res ~= nil
+        local info = INFO or (res and decode(res.Body))
+        if info then
+            if info.message_id then lastMsgId = info.message_id end
+            applyMessage(info.message)
+        end
+        warmDone = true
+    end)
+
+    muteGame()
+    if OutroSfx then
+        task.spawn(function() pcall(function() ContentProvider:PreloadAsync({ OutroSfx }) end) end)
+    end
+    playSfx(IntroSfx, INTRO_VOLUME, 0.25)
+
+    local clock, ticksLive = 0, false
+    table.insert(introConns, RunService.RenderStepped:Connect(function(dt)
+        clock = clock + dt
+        for _, a in ipairs(Arcs) do
+            a.grad.Rotation = (a.grad.Rotation + a.speed * dt) % 360
+        end
+        for _, o in ipairs(Orbs) do
+            local ang = o.phase + clock * o.speed
+            o.frame.Position = UDim2.fromOffset(CX + math.cos(ang) * o.radius, CY + math.sin(ang) * o.radius)
+        end
+        TickHolder.Rotation = (clock * 5) % 360
+        if ticksLive then
+            local head = math.floor(clock * 16) % TICKS
+            for i, tk in ipairs(Ticks) do
+                local base = ((i - 1) % 5 == 0) and 0.15 or 0.6
+                local d = (head - i) % TICKS
+                tk.BackgroundTransparency = d < 14 and base * (d / 14) or base
+            end
+        end
+    end))
+    startParticles()
+
+    -- Phase 1: corners + glow, scan line drops onto the logo position
+    local cam = workspace.CurrentCamera
+    local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
+    local logoY = vp.Y / 2 + (CY - STAGE_H / 2) * StageScale.Scale
+
+    for _, b in ipairs(Brackets) do
+        tween(b, 0.8, ES.Quad, ED.Out, { BackgroundTransparency = 0.35 })
+    end
+    for i, g in ipairs(Glow) do
+        tween(g, 1.0, ES.Sine, ED.Out, { BackgroundTransparency = glowTargets[i] })
+    end
+    tween(ScanBar, 0.15, ES.Quad, ED.Out, { BackgroundTransparency = 0.1 })
+    tween(ScanBar, 0.6, ES.Quad, ED.In, { Position = UDim2.new(0.5, 0, 0, logoY) })
+    task.wait(0.6)
+
+    -- Phase 2: scan hits the logo: flash, pop, shockwaves, tick ring lights up
+    flash(0.5, 0.6)
+    tween(ScanBar, 0.7, ES.Quad, ED.Out,
+        { Position = UDim2.new(0.5, 0, 0, vp.Y + 10), BackgroundTransparency = 1 })
+    LogoHolder.Rotation = -30
+    tween(LogoScale, 0.85, ES.Back, ED.Out, { Scale = 1 })
+    tween(LogoHolder, 0.85, ES.Back, ED.Out, { Rotation = 0 })
+    tween(LogoHolder, 0.4, ES.Quad, ED.Out, { BackgroundTransparency = 0 })
+    tween(LogoHolderStroke, 0.5, ES.Quad, ED.Out, { Transparency = 0.2 })
+    tween(Logo, 0.5, ES.Quad, ED.Out, { ImageTransparency = 0 })
+    tween(LogoFallback, 0.5, ES.Quad, ED.Out, { TextTransparency = 0 })
+    tween(LogoFallbackStroke, 0.5, ES.Quad, ED.Out, { Transparency = 0.3 })
+    shockwave(150, 540, 1.2, 3)
+    task.delay(0.18, function() shockwave(150, 420, 1.0, 2) end)
+
+    tween(BaseStroke, 0.8, ES.Sine, ED.Out, { Transparency = 0.75 })
+    for _, a in ipairs(Arcs) do
+        tween(a.stroke, 0.8, ES.Sine, ED.Out, { Transparency = a.alpha })
+    end
+    for _, o in ipairs(Orbs) do
+        tween(o.frame, 0.8, ES.Sine, ED.Out, { BackgroundTransparency = 0.1 })
+    end
+    for i, tk in ipairs(Ticks) do
+        local base = ((i - 1) % 5 == 0) and 0.15 or 0.6
+        task.delay(i * 0.012, function()
+            tween(tk, 0.25, ES.Quad, ED.Out, { BackgroundTransparency = base })
+        end)
+    end
+    task.delay(1.1, function() ticksLive = true end)
+    task.wait(0.9)
+
+    for i, g in ipairs(Glow) do
+        TweenService:Create(g,
+            TweenInfo.new(1.4 + i * 0.25, ES.Sine, ED.InOut, -1, true),
+            { BackgroundTransparency = glowTargets[i] + 0.05 }):Play()
+    end
+    TweenService:Create(LogoScale,
+        TweenInfo.new(1.6, ES.Sine, ED.InOut, -1, true), { Scale = 1.04 }):Play()
+
+    -- Phase 3: title decodes letter by letter, subtitle in, shimmer sweep
+    for i, l in ipairs(Letters) do
+        decodeLetter(l, (TITLE):sub(i, i), 0.3 + (i - 1) * 0.2)
+    end
+    task.wait(1.25)
+    Subtitle.Position = UDim2.fromOffset(CX, 390)
+    tween(Subtitle, 0.6, ES.Quad, ED.Out, { TextTransparency = 0.2, Position = UDim2.fromOffset(CX, 384) })
+    task.wait(0.2)
+    for i, l in ipairs(Letters) do
+        task.delay((i - 1) * 0.09, function()
+            l.grad.Offset = Vector2.new(-1, 0)
+            tween(l.grad, 0.7, ES.Sine, ED.InOut, { Offset = Vector2.new(1, 0) })
+        end)
+    end
+    task.wait(0.5)
+
+    -- Phase 4: segmented bar + typed status (server warm-up decides the hold)
+    for i, c in ipairs(Cells) do
+        task.delay(i * 0.012, function()
+            tween(c, 0.25, ES.Quad, ED.Out, { BackgroundTransparency = 0 })
+        end)
+    end
+    tween(StageText, 0.4, ES.Quad, ED.Out, { TextTransparency = 0 })
+    tween(PercentText, 0.4, ES.Quad, ED.Out, { TextTransparency = 0 })
+
+    local function setProgress(p, text, dur)
+        if text then typeStatus(text) end
+        tween(ProgressValue, dur or 0.5, ES.Quad, ED.Out, { Value = p })
+    end
+
+    task.wait(0.35)
+    setProgress(0.25, "Initializing...")
+    task.wait(0.7)
+    setProgress(0.55, "Checking environment...")
+    task.wait(0.7)
+    setProgress(0.8, "Connecting to server...", 0.7)
+
+    local waited, wakeShown = 0, false
+    while not warmDone and waited < 20 do
+        task.wait(0.25)
+        waited = waited + 0.25
+        if waited > 3 and not wakeShown then
+            wakeShown = true
+            typeStatus("Waking up server...")
+        end
+    end
+
+    if warmDone and warmOk then
+        setProgress(1, "Ready")
+    else
+        setProgress(1, "Server not responding, continuing...")
+    end
+    task.wait(0.9)
+
+    -- Phase 5: exit: outro sound hits, intro sound fades, visuals dissolve, key window slides in
+    introRunning = false
+    ticksLive = false
+    fadeStopSfx(IntroSfx, INTRO_FADE_OUT)
+    playSfx(OutroSfx, OUTRO_VOLUME, 0.05)
+    flash(0.35, 0.5)
+    shockwave(190, 620, 0.9, 2)
+    tween(LogoScale, 0.6, ES.Back, ED.In, { Scale = 1.3 })
+    fadeOutTree(Container, 0.6)
+    tween(Container, 0.7, ES.Quad, ED.Out, { BackgroundTransparency = 1 })
+    task.wait(0.5)
+
+    KeyFrame.Visible = true
+    fadeKey(true, 0.55)
+    task.wait(1.2)
+    beatLive = true
+
+
+    for _, c in ipairs(introConns) do c:Disconnect() end
+    Container:Destroy()
+end
+
+-----------------------------------------------------------------------
+-- 4. BACKEND LOGIC
+-----------------------------------------------------------------------
+local busy = false
+local verifying = false
+local quickMode = false -- true while auto-logging in with a saved key (no big intro)
+
+-- Discord invite
+DiscordBtn.MouseButton1Click:Connect(function()
+    if busy then return end
+    busy = true
+    local data = (DISCORD and DISCORD ~= "") and { invite = DISCORD } or nil
+    if data and data.invite then
+        if setclipboard then
+            setclipboard(data.invite)
+            DiscordBtn.Text = "COPIED TO CLIPBOARD!"
+        else
+            DiscordBtn.Text = data.invite -- no clipboard support: just show it
+        end
+    else
+        DiscordBtn.Text = "NO DISCORD SET"
+    end
+    task.wait(2.5)
+    DiscordBtn.Text = "COPY DISCORD INVITE"
+    busy = false
+end)
+
+local function startHeartbeat(token, usedKey)
+    task.spawn(function()
+        local wasDisabled = false
+        while true do
+            task.wait(HEARTBEAT_EVERY)
+            local res = request({
+                Url = BACKEND_URL .. "/api/heartbeat",
+                Method = "POST",
+                Headers = { ["Content-Type"] = "application/json" },
+                Body = HttpService:JSONEncode({ userId = LocalPlayer.UserId, token = token }),
+            }, 1)
+            local data = res and decode(res.Body)
+            if data then
+                if data.success then
+                    wasDisabled = false
+                    -- a new /update global message arrived while the script is running
+                    if data.message_id and data.message_id ~= lastMsgId then
+                        lastMsgId = data.message_id
+                        if type(data.message) == "string" and data.message ~= "" then
+                            notify("GENX", data.message)
+                        end
+                    end
+                elseif data.reason == "disabled" then
+                    -- staff paused the loader: tell the user once, keep pinging so it resumes
+                    if not wasDisabled then notify("GENX", data.message or "Loader disabled by staff.") end
+                    wasDisabled = true
+                elseif data.reason then
+                    -- key changed / revoked / expired / session gone: forget the saved key and stop
+                    if data.forget and loadKey() == usedKey then forgetKey() end
+                    pcall(function() getgenv().GENX_SESSION_ENDED = data.reason end)
+                    notify("GENX", data.message or "Session ended.")
+                    break
+                end
+                -- no reason (e.g. rate limited): just try again next beat
+            end
+        end
+    end)
+end
+
+-- returns "ok" (script launched), "rejected" (server says this key is dead), or "fail" (anything else)
+local function verifyKey(userKey, silent)
+    if busy then return "fail" end
+    userKey = (userKey or ""):gsub("%s+", "")
+    if userKey == "" then
+        setStatus("Please enter a key!", COLOR_ERR)
+        shake()
+        return "fail"
+    end
+
+    busy = true
+    verifying = true
+    task.spawn(function()
+        local n = 0
+        Spinner.Visible = true
+        while verifying do
+            EnterBtn.Text = "VERIFYING" .. string.rep(".", n % 4)
+            n = n + 1
+            task.wait(0.3)
+        end
+        Spinner.Visible = false
+    end)
+    setStatus("Verifying key...", COLOR_INFO)
+
+    local outcome = "fail"
+    local res, err = request({
+        Url = BACKEND_URL .. "/api/verify",
+        Method = "POST",
+        Headers = { ["Content-Type"] = "application/json" },
+        Body = HttpService:JSONEncode({
+            loader_id = LOADER_ID, gameId = tostring(game.GameId),
+            key = userKey,
+            userId = LocalPlayer.UserId,
+            username = LocalPlayer.Name,
+            hwid = getHWID(),
+        }),
+    }, 8, function(i) setStatus("Waking up server, hang tight... (" .. i .. "/7)", COLOR_INFO) end)
+
+    local data = res and decode(res.Body)
+
+    if not data then
+        setStatus("Server connection error!\n" .. tostring(err or "bad response"), COLOR_ERR)
+        shake()
+    elseif not data.success then
+        setStatus(data.message or "Invalid key or loader disabled!", COLOR_ERR)
+        if not silent then shake() end
+        -- server says this key is dead (changed / revoked / expired / invalid):
+        -- delete it from this device, but only if it's the one we had saved
+        if data.forget then
+            outcome = "rejected"
+            if loadKey() == userKey then
+                forgetKey()
+                KeyBox.Text = ""
+            end
+        end
+    else
+        -- Compile first so a bad script never leaves the user with a dead UI
+        local fn, compileErr
+        if data.script and data.script ~= "" then
+            fn, compileErr = loadstring(data.script)
+        end
+
+        if data.script and data.script ~= "" and not fn then
+            setStatus("Script failed to load: " .. tostring(compileErr), COLOR_ERR)
+        else
+            saveKey(userKey)
+            applyMessage(data.message)
+            if quickMode and type(data.message) == "string" and data.message ~= "" then
+                notify("GENX", data.message) -- quick login skips the intro, so show the global message as a toast
+            end
+            setStatus("Key valid! Loading script...", COLOR_OK)
+            verifying = false
+            EnterBtn.Text = "ACCESS GRANTED"
+            fadeStopSfx(OutroSfx, 0.8) -- heartbeat stops now that the key is right
+            task.wait(0.8)
+
+            beatLive = false
+            fadeKey(false, 0.4)
+            ecgTarget = 0
+            task.wait(0.5)
+            ScreenGui:Destroy()
+
+            if data.message_id then lastMsgId = data.message_id end
+            if data.token then startHeartbeat(data.token, userKey) end
+            if fn then
+                local ok, runErr = pcall(fn)
+                if not ok then warn("[GENX] Script error: " .. tostring(runErr)) end
+            end
+            return "ok"
+        end
+    end
+
+    verifying = false
+    EnterBtn.Text = "ENTER KEY"
+    busy = false
+    return outcome
+end
+
+EnterBtn.MouseButton1Click:Connect(function() verifyKey(KeyBox.Text) end)
+KeyBox.FocusLost:Connect(function(enterPressed)
+    if enterPressed then verifyKey(KeyBox.Text) end
+end)
+
+-----------------------------------------------------------------------
+-- START
+-----------------------------------------------------------------------
+local saved = loadKey()
+if saved ~= "" then
+    -- QUICK PATH: this device already has a saved key.
+    -- Skip the big intro, show ONLY the key window, log in automatically, run the script.
+    quickMode = true
+    Container.Visible = false
+    KeyBox.Text = saved
+    setStatus("Saved key found, logging in...", COLOR_INFO)
+    KeyFrame.Visible = true
+    fadeKey(true, 0.45)
+    task.delay(0.6, function() beatLive = true end)
+
+    local result = verifyKey(saved, true)
+    if result == "rejected" then
+        -- Saved key is wrong now (changed / revoked / expired): it was already deleted from this
+        -- device. Play the FULL animation, then land on the key window to enter the new key.
+        quickMode = false
+        beatLive = false
+        fadeKey(false, 0.35)
+        task.wait(0.4)
+        KeyFrame.Visible = false
+        Container.Visible = true
+        playIntroAnimation()
+    end
+else
+    -- First run / no saved key: full intro animation, then the key window
+    playIntroAnimation()
+end
